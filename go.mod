@@ -5,7 +5,7 @@ go 1.23.0
 toolchain go1.24.3
 
 require (
-	github.com/shopspring/decimal v0.0.0-20180709203117-cd690d0c9e24
+	github.com/shopspring/decimal v1.4.0
 	github.com/stretchr/testify v1.10.0
 	golang.org/x/net v0.41.0
 )
