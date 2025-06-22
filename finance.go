@@ -3,15 +3,18 @@ package finance
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/http/cookiejar"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/piquette/finance-go/form"
+	"golang.org/x/net/publicsuffix"
 )
 
 // Printfer is an interface to be implemented by Logger.
@@ -22,13 +25,28 @@ type Printfer interface {
 // init sets initial logger defaults.
 func init() {
 	Logger = log.New(os.Stderr, "", log.LstdFlags)
+
+	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	if err != nil {
+		panic(err)
+	}
+
+	httpClient = &http.Client{
+		Jar:     jar,
+		Timeout: defaultHTTPTimeout,
+	}
 }
+
+var (
+	// YFinURL is the URL of the yahoo service backend.
+	YFinURL        = "https://query2.finance.yahoo.com"
+	YQuotePath     = "/v7/finance/quote"
+	YOptionsPrefix = "/v7/finance/options/"
+)
 
 const (
 	// YFinBackend is a constant representing the yahoo service backend.
 	YFinBackend SupportedBackend = "yahoo"
-	// YFinURL is the URL of the yahoo service backend.
-	YFinURL string = "https://query1.finance.yahoo.com"
 	// BATSBackend is a constant representing the uploads service backend.
 	BATSBackend SupportedBackend = "bats"
 	// BATSURL is the URL of the uploads service backend.
@@ -62,8 +80,9 @@ var (
 	// Private vars.
 	// -------------
 
-	httpClient = &http.Client{Timeout: defaultHTTPTimeout}
+	httpClient *http.Client
 	backends   Backends
+	yCrumb     string
 )
 
 // SupportedBackend is an enumeration of supported api endpoints.
@@ -312,6 +331,8 @@ func (s *BackendConfiguration) Call(path string, form *form.Values, ctx *context
 		return err
 	}
 
+	setBrowserHeaders(req)
+
 	if err := s.do(req, v); err != nil {
 		return err
 	}
@@ -366,7 +387,51 @@ func (s *BackendConfiguration) newRequest(method, path string, ctx *context.Cont
 	return req, nil
 }
 
-// do is used by Call to execute an API request and parse the response. It uses
+var (
+	UserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/113.0.0.0 Safari/537.36"
+)
+
+func setBrowserHeaders(req *http.Request) {
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*")
+	req.Header.Set("User-Agent", UserAgent)
+}
+
+func getYahooCrumb(client *http.Client) (string, error) {
+	req, err := http.NewRequest("GET", "https://finance.yahoo.com/", nil)
+	if err != nil {
+		return "", err
+	}
+	setBrowserHeaders(req)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	io.Copy(io.Discard, resp.Body)
+
+	req, err = http.NewRequest("GET", "https://query2.finance.yahoo.com/v1/test/getcrumb", nil)
+	if err != nil {
+		return "", err
+	}
+	setBrowserHeaders(req)
+
+	resp, err = client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	return string(b), nil
+}
+
+// Do is used by Call to execute an API request and parse the response. It uses
 // the backend's HTTP client to execute the request and unmarshals the response
 // into v. It also handles unmarshaling errors returned by the API.
 func (s *BackendConfiguration) do(req *http.Request, v interface{}) error {
@@ -375,6 +440,20 @@ func (s *BackendConfiguration) do(req *http.Request, v interface{}) error {
 	}
 
 	start := time.Now()
+
+	if s.Type == YFinBackend {
+		if yCrumb == "" {
+			crumb, err := getYahooCrumb(s.HTTPClient)
+			if err != nil {
+				return fmt.Errorf("get yahoo crumb err: %w", err)
+			}
+			yCrumb = crumb
+		}
+
+		query := req.URL.Query()
+		query.Add("crumb", yCrumb)
+		req.URL.RawQuery = query.Encode()
+	}
 
 	res, err := s.HTTPClient.Do(req)
 
@@ -402,7 +481,11 @@ func (s *BackendConfiguration) do(req *http.Request, v interface{}) error {
 		if LogLevel > 0 {
 			Logger.Printf("API error: %q\n", resBody)
 		}
-		return CreateRemoteErrorS("error response recieved from upstream api")
+		return &RemoteError{
+			Msg:        "error response recieved from upstream api",
+			StatusCode: res.StatusCode,
+			Body:       string(resBody),
+		}
 	}
 
 	if LogLevel > 2 {
@@ -414,4 +497,14 @@ func (s *BackendConfiguration) do(req *http.Request, v interface{}) error {
 	}
 
 	return nil
+}
+
+type RemoteError struct {
+	Msg        string
+	StatusCode int
+	Body       string
+}
+
+func (e *RemoteError) Error() string {
+	return fmt.Sprintf("status: %d, detail: %s", e.StatusCode, e.Msg)
 }
